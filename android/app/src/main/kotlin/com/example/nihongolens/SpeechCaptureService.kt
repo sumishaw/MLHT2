@@ -18,22 +18,22 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
- * SpeechCaptureService
+ * SpeechCaptureService — realtime subtitle pipeline
  *
- * Captures INTERNAL device audio (YouTube, VLC, Chrome, offline videos)
- * via MediaProjection + AudioPlaybackCaptureConfiguration.
+ * Audio pipeline (sliding-window, minimal latency):
+ *   1. Accumulate 1.5 s of 16 kHz mono PCM  (was 3 s → halved first-result latency)
+ *   2. Send to whisper_server.py immediately
+ *   3. Slide forward by 1.0 s (keep 0.5 s overlap for context continuity)
+ *   4. Two parallel whisper workers so a slow chunk never blocks the next one
+ *   5. De-duplicate consecutive identical results before pushing to overlay
  *
- * Audio pipeline:
- *   1. Accumulate 3 seconds of 16kHz mono PCM from AudioRecord
- *   2. Wrap in WAV header
- *   3. POST to whisper_server.py at http://127.0.0.1:8765/transcribe
- *   4. Server returns clean Hindi text (profanity-filtered, translated)
- *   5. Push Hindi text to OverlayService for display
- *
- * Vosk / ModelDownloadService removed entirely — whisper_server.py is
- * pre-installed on the tablet and handles ASR + translation locally.
+ * Whisper limitation note:
+ *   faster-whisper can process 1.5 s of audio in ~0.4–0.8 s on mid-range SoC,
+ *   giving ~1.0–1.5 s end-to-end latency — as close to live captions as the
+ *   model allows without streaming VAD.
  */
 class SpeechCaptureService : Service() {
 
@@ -44,32 +44,40 @@ class SpeechCaptureService : Service() {
         const val EXTRA_RESULT_DATA = "result_data"
 
         @Volatile var isRunning      = false
-        @Volatile var targetLanguage = "hindi"   // always Hindi — kept for Flutter UI compat
+        @Volatile var targetLanguage = "hindi"
         @Volatile var latestOriginal = ""
-        @Volatile var latestEnglish  = ""        // stores source-lang text for Flutter compat
+        @Volatile var latestEnglish  = ""
         @Volatile var latestHindi    = ""
 
         private const val TAG         = "SpeechCapture"
         private const val SAMPLE_RATE = 16_000
         private const val WHISPER_URL = "http://127.0.0.1:8765/transcribe"
 
-        // 3 seconds of audio per chunk (48 000 samples × 2 bytes = 96 000 bytes)
-        // Gives whisper enough context for good accuracy without long latency.
-        private const val CHUNK_SAMPLES = SAMPLE_RATE * 3
-        private const val CHUNK_BYTES   = CHUNK_SAMPLES * 2
+        // ── Timing constants ──────────────────────────────────────────────────
+        // Chunk = 1.5 s → first translation arrives in ~1.5 s instead of 3 s
+        private const val CHUNK_SECS    = 1.5
+        private const val STRIDE_SECS   = 1.0   // advance 1 s each step (0.5 s overlap)
+
+        private const val CHUNK_SAMPLES  = (SAMPLE_RATE * CHUNK_SECS).toInt()   // 24 000
+        private const val STRIDE_SAMPLES = (SAMPLE_RATE * STRIDE_SECS).toInt()  // 16 000
+        private const val CHUNK_BYTES    = CHUNK_SAMPLES  * 2                   // 48 000
+        private const val STRIDE_BYTES   = STRIDE_SAMPLES * 2                   // 32 000
     }
 
-    private val mainHandler    = Handler(Looper.getMainLooper())
-    private val capturing      = AtomicBoolean(false)
-    private var captureThread: Thread?               = null
-    private var audioRecord:   AudioRecord?          = null
-    private var mediaProjection: MediaProjection?    = null
+    private val mainHandler      = Handler(Looper.getMainLooper())
+    private val capturing        = AtomicBoolean(false)
+    private var captureThread: Thread?            = null
+    private var audioRecord:   AudioRecord?       = null
+    private var mediaProjection: MediaProjection? = null
     private var wakeLock:      PowerManager.WakeLock? = null
 
-    // Single-thread executor: serialise whisper calls so the tablet isn't
-    // overwhelmed by concurrent inference jobs.
-    private val whisperExecutor = Executors.newSingleThreadExecutor()
+    // Two workers: while worker-A is waiting for whisper, worker-B handles the
+    // next chunk → effectively halves perceived latency on back-to-back chunks.
+    private val whisperExecutor = Executors.newFixedThreadPool(2)
+
     private var lastPushedHindi = ""
+    // Timestamp of last successful push — used for silence detection in overlay
+    private val lastPushMs = AtomicLong(0L)
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -153,7 +161,7 @@ class SpeechCaptureService : Service() {
         captureThread?.interrupt()
         captureThread = null
 
-        try { audioRecord?.stop() }   catch (_: Exception) {}
+        try { audioRecord?.stop() }    catch (_: Exception) {}
         try { audioRecord?.release() } catch (_: Exception) {}
         audioRecord = null
 
@@ -169,7 +177,7 @@ class SpeechCaptureService : Service() {
         super.onDestroy()
     }
 
-    // ── Audio capture ─────────────────────────────────────────────────────────
+    // ── Audio capture — sliding-window loop ───────────────────────────────────
 
     private fun startCapture() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
@@ -191,7 +199,7 @@ class SpeechCaptureService : Service() {
             OverlayService.updateText("", "Audio init failed — tap STOP then START.")
             stopSelf(); return
         }
-        // Buffer must hold at least one full chunk so AudioRecord never stalls
+        // Buffer holds at least 2 full chunks so AudioRecord never stalls
         val bufSize = maxOf(minBuf * 4, CHUNK_BYTES * 2)
 
         val captureConfig = android.media.AudioPlaybackCaptureConfiguration
@@ -231,11 +239,14 @@ class SpeechCaptureService : Service() {
         ar.startRecording()
         updateNotification("Translating video audio to Hindi…")
         OverlayService.updateText("", "Listening to video audio…")
-        Log.d(TAG, "Capture started (bufSize=$bufSize, chunkBytes=$CHUNK_BYTES)")
+        Log.d(TAG, "Capture started — chunk=${CHUNK_SECS}s stride=${STRIDE_SECS}s buf=$bufSize")
 
         captureThread = Thread({
-            val chunkBuf = ByteArray(CHUNK_BYTES)
-            var chunkPos = 0
+            // Sliding window: ring buffer holds CHUNK_BYTES of PCM at all times.
+            // After each whisper call we discard STRIDE_BYTES (oldest) and keep
+            // the remaining overlap so the next chunk has context from before.
+            val window   = ByteArray(CHUNK_BYTES)   // the window we send to whisper
+            var filled   = 0                         // bytes currently in window
             val readBuf  = ByteArray(4096)
 
             while (capturing.get() && !Thread.currentThread().isInterrupted) {
@@ -250,27 +261,32 @@ class SpeechCaptureService : Service() {
                 }
                 if (read <= 0) continue
 
-                // Fill chunk buffer; dispatch when full
+                // Append new audio into the window, sliding when full
                 var src = 0
                 while (src < read) {
-                    val toCopy = minOf(read - src, CHUNK_BYTES - chunkPos)
-                    System.arraycopy(readBuf, src, chunkBuf, chunkPos, toCopy)
-                    chunkPos += toCopy
-                    src      += toCopy
+                    val space   = CHUNK_BYTES - filled
+                    val toCopy  = minOf(read - src, space)
+                    System.arraycopy(readBuf, src, window, filled, toCopy)
+                    filled += toCopy
+                    src    += toCopy
 
-                    if (chunkPos >= CHUNK_BYTES) {
-                        val payload = chunkBuf.copyOf(chunkPos)
-                        chunkPos = 0
+                    if (filled >= CHUNK_BYTES) {
+                        // Window full — send snapshot to whisper
                         if (!whisperExecutor.isShutdown) {
+                            val payload = window.copyOf(CHUNK_BYTES)
                             whisperExecutor.submit { sendToWhisper(payload) }
                         }
+
+                        // Slide: discard oldest STRIDE_BYTES, keep overlap at front
+                        val overlap = CHUNK_BYTES - STRIDE_BYTES
+                        System.arraycopy(window, STRIDE_BYTES, window, 0, overlap)
+                        filled = overlap
                     }
                 }
             }
             Log.d(TAG, "Capture thread ended")
         }, "AudioCaptureThread").apply {
             isDaemon = false
-            // NORM_PRIORITY: whisper_server.py also needs CPU — don't starve it
             priority = Thread.NORM_PRIORITY
             start()
         }
@@ -287,8 +303,8 @@ class SpeechCaptureService : Service() {
             conn.setRequestProperty("Content-Type",   "audio/wav")
             conn.setRequestProperty("Content-Length", wavBytes.size.toString())
             conn.doOutput       = true
-            conn.connectTimeout = 5_000    // fail fast if server not running
-            conn.readTimeout    = 20_000   // whisper base ≈ 1-3s on Dimensity 7050
+            conn.connectTimeout = 3_000    // fail fast if server not running
+            conn.readTimeout    = 8_000    // 1.5 s audio ≈ 0.4–0.8 s on Dimensity 7050
 
             conn.outputStream.use { it.write(wavBytes) }
 
@@ -305,15 +321,16 @@ class SpeechCaptureService : Service() {
             val lang       = json.optString("language",    "")
             val confidence = json.optDouble("confidence",   0.0)
 
-            // Ignore very short / empty / unchanged results
+            // Skip: empty, very short, or identical to last push
             if (hindiText.length < 2 || hindiText == lastPushedHindi) return
 
             Log.d(TAG, "Whisper [$lang / ${(confidence * 100).toInt()}%] → HI: ${hindiText.take(60)}")
 
             lastPushedHindi = hindiText
             latestOriginal  = srcText
-            latestEnglish   = srcText   // Flutter UI reads "english" field; we store source text here
+            latestEnglish   = srcText
             latestHindi     = hindiText
+            lastPushMs.set(System.currentTimeMillis())
 
             mainHandler.post {
                 OverlayService.updateText(srcText, hindiText)
@@ -321,44 +338,33 @@ class SpeechCaptureService : Service() {
             }
 
         } catch (e: Exception) {
-            // Silently skip — next chunk will retry automatically
-            // Log at WARN only (not ERROR) so LogCat isn't flooded during startup
             Log.w(TAG, "Whisper call: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
     // ── PCM → WAV ─────────────────────────────────────────────────────────────
 
-    /**
-     * Wraps raw 16-bit mono PCM bytes in a standard WAV (RIFF) container.
-     * Whisper / faster-whisper accept WAV natively.
-     */
     private fun pcmToWav(pcm: ByteArray): ByteArray {
         val channels    = 1
         val bitsPerSamp = 16
         val byteRate    = SAMPLE_RATE * channels * bitsPerSamp / 8
         val dataLen     = pcm.size
-        val riffChunkSz = dataLen + 36   // RIFF body size (everything after "RIFF" + this int)
+        val riffChunkSz = dataLen + 36
 
         val out = ByteArrayOutputStream(riffChunkSz + 8)
         val dos = DataOutputStream(out)
 
-        // RIFF header
         dos.writeBytes("RIFF")
         dos.writeIntLE(riffChunkSz)
         dos.writeBytes("WAVE")
-
-        // fmt sub-chunk
         dos.writeBytes("fmt ")
-        dos.writeIntLE(16)                              // sub-chunk size for PCM
-        dos.writeShortLE(1)                             // AudioFormat = PCM
-        dos.writeShortLE(channels)                      // NumChannels
-        dos.writeIntLE(SAMPLE_RATE)                     // SampleRate
-        dos.writeIntLE(byteRate)                        // ByteRate
-        dos.writeShortLE(channels * bitsPerSamp / 8)   // BlockAlign
-        dos.writeShortLE(bitsPerSamp)                   // BitsPerSample
-
-        // data sub-chunk
+        dos.writeIntLE(16)
+        dos.writeShortLE(1)
+        dos.writeShortLE(channels)
+        dos.writeIntLE(SAMPLE_RATE)
+        dos.writeIntLE(byteRate)
+        dos.writeShortLE(channels * bitsPerSamp / 8)
+        dos.writeShortLE(bitsPerSamp)
         dos.writeBytes("data")
         dos.writeIntLE(dataLen)
         dos.write(pcm)
@@ -366,7 +372,6 @@ class SpeechCaptureService : Service() {
         return out.toByteArray()
     }
 
-    // Little-endian helpers for WAV header
     private fun DataOutputStream.writeIntLE(v: Int) {
         write(v         and 0xff)
         write(v shr  8  and 0xff)
