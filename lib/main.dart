@@ -23,7 +23,6 @@ class CaptionLensApp extends StatelessWidget {
 }
 
 // ── Model / server state machine ───────────────────────────────────────────────
-// "model" here = whisper_server.py readiness (no download needed, it's pre-installed)
 
 enum ModelState { checking, notDownloaded, downloading, ready, error }
 
@@ -44,17 +43,20 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   String displayText      = 'Tap START → approve screen capture → play any video…';
   bool   isRunning        = false;
   bool   hasOverlay       = false;
-  String targetLang       = 'hindi';   // default Hindi — that's the app's purpose
+  String targetLang       = 'hindi';
   String statusMsg        = '';
   int    translationCount = 0;
   bool   _micPulse        = false;
   Timer? _pulseTimer;
 
-  // Whisper server state (reuses ModelState enum so Flutter UI cards still work)
+  // Fast polling — every 500 ms while running
+  Timer? _pollTimer;
+  // Track last seen translation to avoid redundant setState calls
+  String _lastSeenHindi = '';
+
+  // Whisper server state
   ModelState modelState   = ModelState.checking;
   int downloadPercent     = 0;
-  int downloadedMb        = 0;
-  int totalMb             = 0;
   String modelErrorMsg    = '';
 
   // ── init ──────────────────────────────────────────────────────────────────
@@ -88,7 +90,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
             modelErrorMsg = a['message']?.toString() ?? 'Whisper server not reachable';
           });
           break;
-        // onDownloadProgress kept for protocol compatibility — whisper doesn't send it
         case 'onDownloadProgress':
           break;
       }
@@ -125,7 +126,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
-  /// Called when user taps "CHECK / RETRY" — triggers a whisper health check
   Future<void> _startDownload() async {
     try {
       setState(() {
@@ -144,15 +144,42 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   void _applyTranslation(String orig, String en, String hi) {
     if (!mounted) return;
-    // Always show Hindi — that is the only output language for v8
     final show = hi.isNotEmpty ? hi : en;
-    if (show.isEmpty) return;
+    if (show.isEmpty || show == _lastSeenHindi) return;
+    _lastSeenHindi = show;
     setState(() {
       originalText     = orig;
       displayText      = show;
       translationCount++;
     });
   }
+
+  // ── Fast polling ───────────────────────────────────────────────────────────
+  // Poll every 500 ms as a fallback safety net in case a push notification
+  // is dropped (e.g. during heavy UI frame drops). This ensures the Flutter
+  // UI always catches up within half a second at worst.
+
+  void _startPolling() {
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(const Duration(milliseconds: 500), (_) async {
+      if (!isRunning || !mounted) return;
+      try {
+        final result = await _ch.invokeMethod<Map>('getLatestTranslation');
+        if (result == null || !mounted) return;
+        final orig = result['original']?.toString() ?? '';
+        final en   = result['english']?.toString()  ?? '';
+        final hi   = result['hindi']?.toString()    ?? '';
+        _applyTranslation(orig, en, hi);
+      } catch (_) {}
+    });
+  }
+
+  void _stopPolling() {
+    _pollTimer?.cancel();
+    _pollTimer = null;
+  }
+
+  // ── Start / stop ───────────────────────────────────────────────────────────
 
   Future<void> _setLanguage(String lang) async {
     await _ch.invokeMethod('setTargetLanguage', {'language': lang});
@@ -191,6 +218,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       if (mounted) setState(() => _micPulse = !_micPulse);
     });
 
+    _lastSeenHindi = '';
+    _startPolling();
+
     if (mounted) setState(() {
       isRunning        = true;
       translationCount = 0;
@@ -203,6 +233,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Future<void> _stop() async {
     _pulseTimer?.cancel();
     _micPulse = false;
+    _stopPolling();
     await _ch.invokeMethod('stopSpeechCapture');
     await _ch.invokeMethod('stopOverlay');
     if (mounted) setState(() {
@@ -210,12 +241,14 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       statusMsg    = '';
       displayText  = 'Tap START → approve screen capture → play any video…';
       originalText = '';
+      _lastSeenHindi = '';
     });
   }
 
   @override
   void dispose() {
     _pulseTimer?.cancel();
+    _pollTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
